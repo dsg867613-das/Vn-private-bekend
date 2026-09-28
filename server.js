@@ -26,6 +26,7 @@ const PROVIDER_NAME = (process.env.PROVIDER || 'twilio').toLowerCase();
 const TOKEN_TTL_SEC = Number(process.env.TOKEN_TTL_SEC) || 60 * 60 * 24 * 7;
 const BCRYPT_ROUNDS = 12;
 
+// Soft boot warnings (do not crash — Railway health + first deploy need this)
 const bootWarnings = [];
 if (!JWT_SECRET || JWT_SECRET.length < 32) {
   bootWarnings.push('JWT_SECRET missing or shorter than 32 chars — auth will fail until set');
@@ -40,7 +41,9 @@ if (PROVIDER_NAME !== 'twilio') {
 let provider = null;
 function getProvider() {
   if (PROVIDER_NAME !== 'twilio') throw new Error('Only the real Twilio provider is enabled');
-  if (!provider) provider = new TwilioProvider();
+  if (!provider) {
+    provider = new TwilioProvider();
+  }
   return provider;
 }
 
@@ -60,12 +63,14 @@ const globalLimiter = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeade
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many auth attempts. Try again later.' } });
 const expensiveLimiter = rateLimit({ windowMs: 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false });
 
+// Skip rate limit for Twilio webhooks (provider retries must not get 429)
 app.use((req, res, next) => {
   if (req.path.startsWith('/webhooks/')) return next();
   return globalLimiter(req, res, next);
 });
 app.use(express.json({ limit: '64kb' }));
 
+// ---------- JSON DB with simple write queue (reduces lost updates) ----------
 function emptyDb() { return { users: [], numbers: [], calls: [], messages: [], sessions: [], audit: [] }; }
 function normalize(db) {
   const d = db || emptyDb();
@@ -161,9 +166,15 @@ function ownNumber(db, userId, numberId) {
   return db.numbers.find(n => n.id === numberId && n.userId === userId && n.status === 'active');
 }
 
-app.get('/', (_req, res) => res.json({ name: 'PrivateVN', version: 3, provider: PROVIDER_NAME, warnings: bootWarnings }));
+app.get('/', (_req, res) => res.json({
+  name: 'PrivateVN',
+  version: 3,
+  provider: PROVIDER_NAME,
+  warnings: bootWarnings
+}));
 app.get('/health', (_req, res) => res.json({
-  ok: true, ts: Date.now(),
+  ok: true,
+  ts: Date.now(),
   configured: {
     jwt: !!(JWT_SECRET && JWT_SECRET.length >= 32),
     publicUrl: PUBLIC_BASE_URL.startsWith('https://'),
@@ -180,16 +191,23 @@ app.post('/auth/register', authLimiter, async (req, res) => {
     if (!validUsername(username)) return res.status(400).json({ error: 'Username 3-32 chars, alphanumeric/underscore' });
     if (!validPassword(password)) return res.status(400).json({ error: 'Password must be 8-128 characters' });
     const db = load();
-    if (db.users.some(u => u.username.toLowerCase() === username.toLowerCase())) return res.status(409).json({ error: 'Username taken' });
+    if (db.users.some(u => u.username.toLowerCase() === username.toLowerCase())) {
+      return res.status(409).json({ error: 'Username taken' });
+    }
     const user = { id: uuid(), username, passwordHash: await bcrypt.hash(password, BCRYPT_ROUNDS), createdAt: Date.now() };
     const sessionId = uuid();
     const expiresAt = Date.now() + TOKEN_TTL_SEC * 1000;
     db.users.push(user);
-    db.sessions.push({ id: sessionId, userId: user.id, label: String(req.body.deviceLabel || 'Android').slice(0, 64), createdAt: Date.now(), lastUsedAt: Date.now(), expiresAt, revokedAt: null });
+    db.sessions.push({
+      id: sessionId, userId: user.id, label: String(req.body.deviceLabel || 'Android').slice(0, 64),
+      createdAt: Date.now(), lastUsedAt: Date.now(), expiresAt, revokedAt: null
+    });
     audit(db, user.id, 'register', null);
     await save(db);
     res.status(201).json({ token: issueToken(user, sessionId), userId: user.id, username: user.username, sessionId });
-  } catch { res.status(500).json({ error: 'Registration failed' }); }
+  } catch {
+    res.status(500).json({ error: 'Registration failed' });
+  }
 });
 
 app.post('/auth/login', authLimiter, async (req, res) => {
@@ -200,14 +218,21 @@ app.post('/auth/login', authLimiter, async (req, res) => {
     if (!username || !password) return res.status(400).json({ error: 'Credentials required' });
     const db = load();
     const user = db.users.find(u => u.username.toLowerCase() === username.toLowerCase());
-    if (!user || !(await bcrypt.compare(password, user.passwordHash))) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
     const sessionId = uuid();
     const expiresAt = Date.now() + TOKEN_TTL_SEC * 1000;
-    db.sessions.push({ id: sessionId, userId: user.id, label: String(req.body.deviceLabel || 'Android').slice(0, 64), createdAt: Date.now(), lastUsedAt: Date.now(), expiresAt, revokedAt: null });
+    db.sessions.push({
+      id: sessionId, userId: user.id, label: String(req.body.deviceLabel || 'Android').slice(0, 64),
+      createdAt: Date.now(), lastUsedAt: Date.now(), expiresAt, revokedAt: null
+    });
     audit(db, user.id, 'login', null);
     await save(db);
     res.json({ token: issueToken(user, sessionId), userId: user.id, username: user.username, sessionId });
-  } catch { res.status(500).json({ error: 'Login failed' }); }
+  } catch {
+    res.status(500).json({ error: 'Login failed' });
+  }
 });
 
 app.post('/auth/logout', auth, async (req, res) => {
@@ -222,7 +247,9 @@ app.post('/auth/logout', auth, async (req, res) => {
 app.post('/auth/revoke-all', auth, async (req, res) => {
   const db = load();
   const now = Date.now();
-  for (const s of db.sessions) { if (s.userId === req.user.sub && !s.revokedAt) s.revokedAt = now; }
+  for (const s of db.sessions) {
+    if (s.userId === req.user.sub && !s.revokedAt) s.revokedAt = now;
+  }
   audit(db, req.user.sub, 'revoke_all', null);
   await save(db);
   res.json({ ok: true });
@@ -230,9 +257,11 @@ app.post('/auth/revoke-all', auth, async (req, res) => {
 
 app.get('/auth/sessions', auth, (req, res) => {
   const db = load();
-  res.json(db.sessions.filter(s => s.userId === req.user.sub).map(s => ({
-    id: s.id, label: s.label, createdAt: s.createdAt, lastUsedAt: s.lastUsedAt, expiresAt: s.expiresAt, revoked: !!s.revokedAt, current: s.id === req.sessionId
-  })).sort((a, b) => (b.lastUsedAt || 0) - (a.lastUsedAt || 0)));
+  const list = db.sessions.filter(s => s.userId === req.user.sub).map(s => ({
+    id: s.id, label: s.label, createdAt: s.createdAt, lastUsedAt: s.lastUsedAt,
+    expiresAt: s.expiresAt, revoked: !!s.revokedAt, current: s.id === req.sessionId
+  })).sort((a, b) => (b.lastUsedAt || 0) - (a.lastUsedAt || 0));
+  res.json(list);
 });
 
 app.post('/auth/sessions/:id/revoke', auth, async (req, res) => {
@@ -247,12 +276,16 @@ app.post('/auth/sessions/:id/revoke', auth, async (req, res) => {
 
 app.get('/numbers', auth, (req, res) => {
   const db = load();
-  res.json(db.numbers.filter(n => n.userId === req.user.sub && n.status !== 'released').sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)));
+  res.json(db.numbers.filter(n => n.userId === req.user.sub && n.status !== 'released')
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)));
 });
 
 app.get('/numbers/available', auth, expensiveLimiter, async (req, res) => {
-  try { res.json(await getProvider().listAvailableNumbers()); }
-  catch (e) { res.status(502).json({ error: e.message || 'Provider unavailable' }); }
+  try {
+    res.json(await getProvider().listAvailableNumbers());
+  } catch (e) {
+    res.status(502).json({ error: e.message || 'Provider unavailable' });
+  }
 });
 
 app.post('/numbers', auth, expensiveLimiter, async (req, res) => {
@@ -261,8 +294,12 @@ app.post('/numbers', auth, expensiveLimiter, async (req, res) => {
     const label = String(req.body.label || 'Number').trim().slice(0, 64);
     if (!validPhone(phoneNumber)) return res.status(400).json({ error: 'Valid E.164 phone required' });
     const db = load();
-    if (db.numbers.filter(n => n.userId === req.user.sub && n.status === 'active').length >= MAX_NUMBERS) return res.status(403).json({ error: `Maximum ${MAX_NUMBERS} active numbers` });
-    if (db.numbers.some(n => n.phoneNumber === phoneNumber && n.status === 'active')) return res.status(409).json({ error: 'Number already assigned' });
+    if (db.numbers.filter(n => n.userId === req.user.sub && n.status === 'active').length >= MAX_NUMBERS) {
+      return res.status(403).json({ error: `Maximum ${MAX_NUMBERS} active numbers` });
+    }
+    if (db.numbers.some(n => n.phoneNumber === phoneNumber && n.status === 'active')) {
+      return res.status(409).json({ error: 'Number already assigned' });
+    }
     const p = getProvider();
     const assigned = await p.assignNumber(phoneNumber);
     try {
@@ -280,7 +317,9 @@ app.post('/numbers', auth, expensiveLimiter, async (req, res) => {
     audit(db, req.user.sub, 'assign_number', { phoneNumber: row.phoneNumber });
     await save(db);
     res.status(201).json(row);
-  } catch (e) { res.status(400).json({ error: e.message || 'Assign failed' }); }
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'Assign failed' });
+  }
 });
 
 function applyNumberPatch(n, patch) {
@@ -314,7 +353,9 @@ app.post('/numbers/:id/update', auth, async (req, res) => {
     audit(db, req.user.sub, 'update_number', { id: n.id });
     await save(db);
     res.json(n);
-  } catch (e) { res.status(400).json({ error: e.message || 'Update failed' }); }
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'Update failed' });
+  }
 });
 app.patch('/numbers/:id', auth, async (req, res) => {
   try {
@@ -325,7 +366,9 @@ app.patch('/numbers/:id', auth, async (req, res) => {
     audit(db, req.user.sub, 'update_number', { id: n.id });
     await save(db);
     res.json(n);
-  } catch (e) { res.status(400).json({ error: e.message || 'Update failed' }); }
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'Update failed' });
+  }
 });
 
 async function releaseNumberHandler(req, res) {
@@ -337,11 +380,14 @@ async function releaseNumberHandler(req, res) {
       try { await getProvider().releaseNumber(n.providerNumberId); }
       catch (e) { return res.status(502).json({ error: e.message || 'Provider release failed' }); }
     }
-    n.status = 'released'; n.releasedAt = Date.now();
+    n.status = 'released';
+    n.releasedAt = Date.now();
     audit(db, req.user.sub, 'release_number', { phoneNumber: n.phoneNumber });
     await save(db);
     res.json({ ok: true });
-  } catch (e) { res.status(400).json({ error: e.message || 'Release failed' }); }
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'Release failed' });
+  }
 }
 app.post('/numbers/:id/delete', auth, expensiveLimiter, releaseNumberHandler);
 app.delete('/numbers/:id', auth, expensiveLimiter, releaseNumberHandler);
@@ -350,17 +396,29 @@ app.post('/calls', auth, expensiveLimiter, async (req, res) => {
   try {
     const virtualNumberId = String(req.body.virtualNumberId || '');
     const destination = String(req.body.destination || '').trim();
-    if (!virtualNumberId || !validPhone(destination)) return res.status(400).json({ error: 'Valid destination required (E.164)' });
+    if (!virtualNumberId || !validPhone(destination)) {
+      return res.status(400).json({ error: 'Valid destination required (E.164)' });
+    }
     const db = load();
     const n = ownNumber(db, req.user.sub, virtualNumberId);
     if (!n) return res.status(404).json({ error: 'Number not found' });
-    const result = await getProvider().makeCall(n.phoneNumber, destination, webhookUrl('/webhooks/twilio/voice/status'), webhookUrl('/webhooks/twilio/voice/outbound'));
-    const row = { id: uuid(), userId: req.user.sub, virtualNumberId: n.id, from: n.phoneNumber, to: destination, direction: 'out', status: result.status || 'initiated', providerCallId: result.providerCallId || null, mock: !!result.mock, createdAt: Date.now() };
+    const result = await getProvider().makeCall(
+      n.phoneNumber, destination,
+      webhookUrl('/webhooks/twilio/voice/status'),
+      webhookUrl('/webhooks/twilio/voice/outbound')
+    );
+    const row = {
+      id: uuid(), userId: req.user.sub, virtualNumberId: n.id, from: n.phoneNumber, to: destination,
+      direction: 'out', status: result.status || 'initiated', providerCallId: result.providerCallId || null,
+      mock: !!result.mock, createdAt: Date.now()
+    };
     db.calls.push(row);
     audit(db, req.user.sub, 'start_call', { to: destination });
     await save(db);
     res.status(201).json(row);
-  } catch (e) { res.status(400).json({ error: e.message || 'Call failed' }); }
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'Call failed' });
+  }
 });
 
 app.get('/calls', auth, (req, res) => {
@@ -393,19 +451,27 @@ app.post('/messages', auth, expensiveLimiter, async (req, res) => {
     const virtualNumberId = String(req.body.virtualNumberId || '');
     const to = String(req.body.to || '').trim();
     const body = String(req.body.body || '');
-    if (!virtualNumberId || !validPhone(to) || !body) return res.status(400).json({ error: 'Valid number and message required' });
+    if (!virtualNumberId || !validPhone(to) || !body) {
+      return res.status(400).json({ error: 'Valid number and message required' });
+    }
     if (body.length > 1600) return res.status(400).json({ error: 'Message too long (max 1600)' });
     const db = load();
     const n = ownNumber(db, req.user.sub, virtualNumberId);
     if (!n) return res.status(404).json({ error: 'Number not found' });
     if (n.outgoingSmsEnabled === false) return res.status(403).json({ error: 'Outgoing SMS disabled' });
     const result = await getProvider().sendSms(n.phoneNumber, to, body, webhookUrl('/webhooks/twilio/sms/status'));
-    const row = { id: uuid(), userId: req.user.sub, virtualNumberId: n.id, from: n.phoneNumber, to, body, direction: 'out', status: result.status || 'queued', providerMessageId: result.providerMessageId || null, mock: !!result.mock, createdAt: Date.now() };
+    const row = {
+      id: uuid(), userId: req.user.sub, virtualNumberId: n.id, from: n.phoneNumber, to, body,
+      direction: 'out', status: result.status || 'queued', providerMessageId: result.providerMessageId || null,
+      mock: !!result.mock, createdAt: Date.now()
+    };
     db.messages.push(row);
     audit(db, req.user.sub, 'send_sms', { to });
     await save(db);
     res.status(201).json(row);
-  } catch (e) { res.status(400).json({ error: e.message || 'SMS failed' }); }
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'SMS failed' });
+  }
 });
 
 app.get('/messages', auth, (req, res) => {
@@ -430,4 +496,95 @@ app.get('/voice/token', auth, (req, res) => {
   try {
     if (PROVIDER_NAME !== 'twilio') return res.status(400).json({ error: 'Voice SDK token requires Twilio' });
     const AccessToken = twilio.jwt.AccessToken;
-  xpx
+    const VoiceGrant = AccessToken.VoiceGrant;
+    const keySid = process.env.TWILIO_API_KEY_SID;
+    const keySecret = process.env.TWILIO_API_KEY_SECRET;
+    const appSid = process.env.TWILIO_TWIML_APP_SID;
+    if (!keySid || !keySecret || !appSid || !process.env.TWILIO_ACCOUNT_SID) {
+      return res.status(503).json({ error: 'Twilio Voice SDK credentials not configured' });
+    }
+    const identity = `pvn-${req.user.sub}`;
+    const token = new AccessToken(process.env.TWILIO_ACCOUNT_SID, keySid, keySecret, { identity, ttl: 3600 });
+    token.addGrant(new VoiceGrant({ outgoingApplicationSid: appSid, incomingAllow: true }));
+    res.json({ token: token.toJwt(), identity });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Token failed' });
+  }
+});
+
+app.post('/webhooks/twilio/voice/incoming', express.urlencoded({ extended: false }), requireTwilioWebhook, async (req, res) => {
+  const db = load();
+  const to = String(req.body.To || '');
+  const from = String(req.body.From || '');
+  const n = db.numbers.find(x => x.phoneNumber === to && x.status === 'active');
+  const vr = new twilio.twiml.VoiceResponse();
+  if (!n || n.incomingCallsEnabled === false || n.callMode !== 'TWO_WAY') {
+    vr.reject();
+    return res.type('text/xml').send(vr.toString());
+  }
+  db.calls.push({
+    id: uuid(), userId: n.userId, virtualNumberId: n.id, from, to, direction: 'in',
+    status: 'ringing', providerCallId: req.body.CallSid || null, createdAt: Date.now()
+  });
+  await save(db);
+  const dial = vr.dial({ answerOnBridge: true });
+  dial.client(`pvn-${n.userId}`);
+  res.type('text/xml').send(vr.toString());
+});
+
+app.post('/webhooks/twilio/voice/outbound', express.urlencoded({ extended: false }), requireTwilioWebhook, (req, res) => {
+  const vr = new twilio.twiml.VoiceResponse();
+  vr.say({ voice: 'alice' }, 'Connecting your call.');
+  res.type('text/xml').send(vr.toString());
+});
+
+app.post('/webhooks/twilio/voice/status', express.urlencoded({ extended: false }), requireTwilioWebhook, async (req, res) => {
+  const db = load();
+  const sid = String(req.body.CallSid || '');
+  const c = db.calls.find(x => x.providerCallId === sid);
+  if (c) {
+    c.status = String(req.body.CallStatus || c.status);
+    if (req.body.CallDuration) c.duration = Number(req.body.CallDuration);
+    c.updatedAt = Date.now();
+    await save(db);
+  }
+  res.sendStatus(204);
+});
+
+app.post('/webhooks/twilio/sms/incoming', express.urlencoded({ extended: false }), requireTwilioWebhook, async (req, res) => {
+  const db = load();
+  const to = String(req.body.To || '');
+  const from = String(req.body.From || '');
+  const body = String(req.body.Body || '').slice(0, 1600);
+  const n = db.numbers.find(x => x.phoneNumber === to && x.status === 'active' && x.incomingSmsEnabled !== false);
+  if (n) {
+    db.messages.push({
+      id: uuid(), userId: n.userId, virtualNumberId: n.id, from, to, body, direction: 'in',
+      status: 'received', read: false, providerMessageId: req.body.MessageSid || null, createdAt: Date.now()
+    });
+    await save(db);
+  }
+  res.type('text/xml').send(new twilio.twiml.MessagingResponse().toString());
+});
+
+app.post('/webhooks/twilio/sms/status', express.urlencoded({ extended: false }), requireTwilioWebhook, async (req, res) => {
+  const db = load();
+  const sid = String(req.body.MessageSid || '');
+  const m = db.messages.find(x => x.providerMessageId === sid);
+  if (m) {
+    m.status = String(req.body.MessageStatus || m.status);
+    m.updatedAt = Date.now();
+    await save(db);
+  }
+  res.sendStatus(204);
+});
+
+app.use((err, _req, res, _next) => {
+  console.error('server error', err && err.message ? err.message : err);
+  if (!res.headersSent) res.status(500).json({ error: 'Server error' });
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Private VN backend v3 on :${PORT} provider=${PROVIDER_NAME}`);
+  if (bootWarnings.length) console.warn('Boot warnings:', bootWarnings.join('; '));
+});
